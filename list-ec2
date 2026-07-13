@@ -1,0 +1,536 @@
+#!/usr/bin/env bash
+set -u
+
+AWS_PROFILE="${AWS_PROFILE:-ar-aws-innovation}"
+export AWS_PROFILE
+
+# Set this to your org-approved regions
+REGIONS="${REGIONS:-us-west-2 us-east-2}"
+
+# AWS/API tunables
+AWS_CONNECT_TIMEOUT="${AWS_CONNECT_TIMEOUT:-15}"
+AWS_READ_TIMEOUT="${AWS_READ_TIMEOUT:-20}"
+AWS_MAX_ATTEMPTS="${AWS_MAX_ATTEMPTS:-5}"
+AWS_RETRY_MODE="${AWS_RETRY_MODE:-standard}"
+ENABLE_CLOUDTRAIL="${ENABLE_CLOUDTRAIL:-0}"
+ENABLE_OWNER_TAGS="${ENABLE_OWNER_TAGS:-0}"
+ENABLE_STS="${ENABLE_STS:-0}"
+CT_LOOKBACK_DAYS="${CT_LOOKBACK_DAYS:-90}"
+# Empty means "no explicit cap" (CloudTrail default pagination behavior)
+CT_MAX_ITEMS="${CT_MAX_ITEMS:-}"
+CT_BATCH_SIZE="${CT_BATCH_SIZE:-100}"
+
+# Train-check tunables
+CHECK_TRAIN="${CHECK_TRAIN:-1}"
+SSH_USER="${SSH_USER:-ubuntu}"
+SSH_KEY="${SSH_KEY:-$HOME/.ssh/jonahsiekmann-ec2-key.pem}"
+SSH_TIMEOUT_SEC="${SSH_TIMEOUT_SEC:-8}"
+TRAIN_JOBS="${TRAIN_JOBS:-16}"
+TRAIN_GREP="${TRAIN_GREP:-agility\.(rl|learn)\.scripts\.train}"
+PROFILE="${PROFILE:-0}"
+PROFILE_START="$SECONDS"
+
+export AWS_MAX_ATTEMPTS AWS_RETRY_MODE
+
+aws_cli() {
+  aws --no-cli-pager --cli-connect-timeout "$AWS_CONNECT_TIMEOUT" --cli-read-timeout "$AWS_READ_TIMEOUT" "$@"
+}
+
+profile_log() {
+  [[ "$PROFILE" == "1" ]] || return 0
+  printf "[profile +%ss] %s\n" "$((SECONDS - PROFILE_START))" "$*" >&2
+}
+
+is_sso_auth_error() {
+  local msg="$1"
+  [[ "$msg" == *"Error when retrieving token from sso"* ||
+     "$msg" == *"Token has expired"* ||
+     "$msg" == *"UnauthorizedSSOTokenError"* ]]
+}
+
+json_array_from_args() {
+  jq -cn '$ARGS.positional' --args "$@"
+}
+
+check_train_status() {
+  local public_ip="$1"
+  local remote_cmd out rc first_line desc
+
+  if [[ "$CHECK_TRAIN" != "1" ]]; then
+    printf "skipped\t-\n"
+    return 0
+  fi
+
+  if [[ -z "$public_ip" || "$public_ip" == "None" || "$public_ip" == "-" ]]; then
+    printf "no-public-ip\t-\n"
+    return 0
+  fi
+
+  remote_cmd="ps -ef | grep -E '$TRAIN_GREP' | grep -v grep || true"
+
+  if command -v timeout >/dev/null 2>&1; then
+    out="$(timeout "${SSH_TIMEOUT_SEC}s" ssh -i "$SSH_KEY" \
+      -o BatchMode=yes \
+      -o ConnectTimeout="$SSH_TIMEOUT_SEC" \
+      -o StrictHostKeyChecking=no \
+      -o UserKnownHostsFile=/dev/null \
+      -o LogLevel=ERROR \
+      "${SSH_USER}@${public_ip}" "$remote_cmd" 2>/dev/null)"
+    rc=$?
+  else
+    out="$(ssh -i "$SSH_KEY" \
+      -o BatchMode=yes \
+      -o ConnectTimeout="$SSH_TIMEOUT_SEC" \
+      -o StrictHostKeyChecking=no \
+      -o UserKnownHostsFile=/dev/null \
+      -o LogLevel=ERROR \
+      "${SSH_USER}@${public_ip}" "$remote_cmd" 2>/dev/null)"
+    rc=$?
+  fi
+
+  if [[ "$rc" -eq 124 ]]; then
+    printf "ssh-timeout\t-\n"
+    return 0
+  fi
+
+  if [[ "$rc" -ne 0 ]]; then
+    printf "ssh-failed\t-\n"
+    return 0
+  fi
+
+  first_line="$(printf '%s\n' "$out" | sed '/^[[:space:]]*$/d' | head -n 1)"
+  if [[ -z "$first_line" ]]; then
+    printf "not-running\t-\n"
+    return 0
+  fi
+
+  # Pull the value after the first --desc* arg found (--desc/--descr/--description).
+  # Supports both "--description value" and "--description=value" forms.
+  desc="$(printf '%s\n' "$out" | awk '
+    NF {
+      for (i = 1; i <= NF; i++) {
+        if ($i ~ /^--desc/) {
+          if (index($i, "=") > 0) {
+            val = $i
+            sub(/^[^=]*=/, "", val)
+            print val
+            exit
+          }
+          if (i < NF) {
+            print $(i + 1)
+            exit
+          }
+        }
+      }
+    }
+  ')"
+
+  if [[ -z "$desc" ]]; then
+    desc="-"
+  fi
+
+  desc="${desc//$'\t'/ }"
+  desc="${desc//$'\n'/ }"
+  desc="${desc%\"}"
+  desc="${desc#\"}"
+  desc="${desc%\'}"
+  desc="${desc#\'}"
+
+  if [[ -z "$desc" ]]; then
+    desc="-"
+  fi
+
+  printf "running\t%s\n" "$desc"
+}
+
+if [[ "$ENABLE_STS" == "1" ]]; then
+  caller_out="$(aws_cli sts get-caller-identity --query Arn --output text 2>&1)"
+  caller_rc=$?
+  if [[ "$caller_rc" -eq 0 ]]; then
+    caller_arn="$caller_out"
+  elif is_sso_auth_error "$caller_out"; then
+    echo "AWS auth failed: $(printf '%s\n' "$caller_out" | sed '/^[[:space:]]*$/d' | head -n 1)" >&2
+    echo "Run: aws sso login --profile $AWS_PROFILE" >&2
+    exit 1
+  else
+    caller_arn=""
+  fi
+else
+  caller_arn=""
+fi
+caller_user="${caller_arn##*/}"
+caller_short="${caller_user%@*}"
+caller_dotless="${caller_short//./}"
+ME="${ME:-${caller_user:-${USER:-}}}"
+CT_USERNAME="${CT_USERNAME:-$ME}"
+me_short="${ME%@*}"
+me_dotless="${me_short//./}"
+profile_log "resolved caller identity"
+
+# Build unique candidate values used for tag matching.
+declare -a candidate_values=()
+for v in "$ME" "$me_short" "$me_dotless" "$caller_short" "$caller_dotless" "$caller_arn"; do
+  [[ -z "$v" || "$v" == "None" ]] && continue
+  exists=0
+  for have in "${candidate_values[@]:-}"; do
+    if [[ "$have" == "$v" ]]; then
+      exists=1
+      break
+    fi
+  done
+  [[ "$exists" -eq 0 ]] && candidate_values+=("$v")
+done
+values_csv=""
+if [[ "${#candidate_values[@]}" -gt 0 ]]; then
+  values_csv="$(IFS=,; echo "${candidate_values[*]}")"
+fi
+
+declare -a name_values=()
+for v in "$me_short" "$me_dotless" "$caller_short" "$caller_dotless"; do
+  [[ -z "$v" || "$v" == "None" ]] && continue
+  for pattern in "$v" "$v-*"; do
+    exists=0
+    for have in "${name_values[@]:-}"; do
+      if [[ "$have" == "$pattern" ]]; then
+        exists=1
+        break
+      fi
+    done
+    [[ "$exists" -eq 0 ]] && name_values+=("$pattern")
+  done
+done
+name_values_csv=""
+if [[ "${#name_values[@]}" -gt 0 ]]; then
+  name_values_csv="$(IFS=,; echo "${name_values[*]}")"
+fi
+
+if ! [[ "$TRAIN_JOBS" =~ ^[0-9]+$ ]] || [[ "$TRAIN_JOBS" -lt 1 ]]; then
+  TRAIN_JOBS=1
+fi
+
+if [[ "$CHECK_TRAIN" == "1" ]]; then
+  if ! command -v ssh >/dev/null 2>&1; then
+    echo "Train check disabled: ssh not found on PATH" >&2
+    CHECK_TRAIN=0
+  elif [[ ! -r "$SSH_KEY" ]]; then
+    echo "Train check disabled: SSH key is not readable at $SSH_KEY" >&2
+    CHECK_TRAIN=0
+  fi
+fi
+
+declare -A seen
+count=0
+TAG_KEYS=(Owner CreatedBy Creator owner created_by creator ProvisionedBy)
+ROW_FILE="$(mktemp)"
+TRAIN_TMPDIR=""
+
+cleanup() {
+  rm -f "$ROW_FILE"
+  if [[ -n "$TRAIN_TMPDIR" ]]; then
+    rm -rf "$TRAIN_TMPDIR"
+  fi
+}
+trap cleanup EXIT
+
+print_row() {
+  local region="$1"
+  local iid="$2"
+  local name="$3"
+  local private_ip="$4"
+  local public_ip="$5"
+  local matched_by="$6"
+
+  [[ -z "$iid" || "$iid" == "None" ]] && return 0
+
+  local key="${region}:${iid}"
+  [[ -n "${seen[$key]:-}" ]] && return 0
+  seen["$key"]=1
+
+  [[ -z "$name" || "$name" == "None" ]] && name="-"
+  [[ -z "$private_ip" || "$private_ip" == "None" ]] && private_ip="-"
+  [[ -z "$public_ip" || "$public_ip" == "None" ]] && public_ip="-"
+
+  printf "%s\t%s\t%s\t%s\t%s\t%s\n" \
+    "$region" "$iid" "$name" "$private_ip" "$public_ip" "$matched_by" >> "$ROW_FILE"
+  count=$((count + 1))
+}
+
+process_rows() {
+  local region="$1"
+  local matched_by="$2"
+  local rows="$3"
+
+  [[ -z "$rows" || "$rows" == "None" ]] && return 0
+
+  while IFS=$'\t' read -r iid name private_ip public_ip; do
+    print_row "$region" "$iid" "$name" "$private_ip" "$public_ip" "$matched_by"
+  done <<< "$rows"
+}
+
+process_rows_with_match() {
+  local rows="$1"
+
+  [[ -z "$rows" || "$rows" == "None" ]] && return 0
+
+  while IFS=$'\t' read -r region iid name private_ip public_ip matched_by; do
+    print_row "$region" "$iid" "$name" "$private_ip" "$public_ip" "$matched_by"
+  done <<< "$rows"
+}
+
+output_rows() {
+  local row_file="$1"
+  local region iid name private_ip public_ip matched_by
+  local train_status train_desc
+  local idx job_idx pid
+  local -a pids=()
+
+  echo -e "Region\tInstanceId\tName\tPrivateIP\tPublicIP\tMatchedBy\tTrainStatus\tTrainDesc"
+
+  if [[ "$CHECK_TRAIN" != "1" ]]; then
+    while IFS=$'\t' read -r region iid name private_ip public_ip matched_by; do
+      printf "%s\t%s\t%s\t%s\t%s\t%s\tskipped\t-\n" \
+        "$region" "$iid" "$name" "$private_ip" "$public_ip" "$matched_by"
+    done < "$row_file"
+    return 0
+  fi
+
+  profile_log "starting train checks"
+
+  if [[ "$TRAIN_JOBS" -le 1 ]]; then
+    while IFS=$'\t' read -r region iid name private_ip public_ip matched_by; do
+      IFS=$'\t' read -r train_status train_desc < <(check_train_status "$public_ip")
+      printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+        "$region" "$iid" "$name" "$private_ip" "$public_ip" "$matched_by" "$train_status" "$train_desc"
+    done < "$row_file"
+    return 0
+  fi
+
+  TRAIN_TMPDIR="$(mktemp -d)"
+  idx=0
+  while IFS=$'\t' read -r region iid name private_ip public_ip matched_by; do
+    [[ -z "$iid" ]] && continue
+    job_idx="$idx"
+    (
+      local status desc
+      IFS=$'\t' read -r status desc < <(check_train_status "$public_ip")
+      printf "%s\t%s\n" "$status" "$desc" > "$TRAIN_TMPDIR/$job_idx"
+    ) &
+    pids+=("$!")
+    idx=$((idx + 1))
+
+    if [[ "${#pids[@]}" -ge "$TRAIN_JOBS" ]]; then
+      wait "${pids[0]}" || true
+      pids=("${pids[@]:1}")
+    fi
+  done < "$row_file"
+
+  if [[ "${#pids[@]}" -gt 0 ]]; then
+    for pid in "${pids[@]}"; do
+      wait "$pid" || true
+    done
+  fi
+
+  idx=0
+  while IFS=$'\t' read -r region iid name private_ip public_ip matched_by; do
+    [[ -z "$iid" ]] && continue
+    train_status="ssh-failed"
+    train_desc="-"
+    if [[ -s "$TRAIN_TMPDIR/$idx" ]]; then
+      IFS=$'\t' read -r train_status train_desc < "$TRAIN_TMPDIR/$idx"
+    fi
+    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+      "$region" "$iid" "$name" "$private_ip" "$public_ip" "$matched_by" "$train_status" "$train_desc"
+    idx=$((idx + 1))
+  done < "$row_file"
+
+  profile_log "finished train checks"
+}
+
+echo "AWS_PROFILE=$AWS_PROFILE"
+if [[ -n "$caller_arn" && "$caller_arn" != "None" ]]; then
+  echo "CallerArn: $caller_arn"
+elif [[ "$ENABLE_STS" == "1" ]]; then
+  echo "CallerArn: <unavailable>; set ME=... manually if needed" >&2
+else
+  echo "CallerArn: <not resolved; set ENABLE_STS=1 to print it>"
+fi
+echo "Match value (override with ME=...): ${ME:-<empty>}"
+if [[ -n "$name_values_csv" ]]; then
+  echo "Name match values: $name_values_csv"
+fi
+if [[ "$ENABLE_CLOUDTRAIL" == "1" ]]; then
+  if [[ -n "$CT_MAX_ITEMS" ]]; then
+    echo "CloudTrail matching: enabled (lookback=${CT_LOOKBACK_DAYS}d, max_items=$CT_MAX_ITEMS)"
+  else
+    echo "CloudTrail matching: enabled (lookback=${CT_LOOKBACK_DAYS}d, max_items=default)"
+  fi
+else
+  echo "CloudTrail matching: disabled (set ENABLE_CLOUDTRAIL=1 for launch-history matching)"
+fi
+if [[ "$ENABLE_OWNER_TAGS" == "1" ]]; then
+  echo "Owner tag matching: enabled"
+else
+  echo "Owner tag matching: disabled (set ENABLE_OWNER_TAGS=1 for Owner/CreatedBy tags)"
+fi
+if [[ "$CHECK_TRAIN" == "1" ]]; then
+  echo "Train check: enabled (user=$SSH_USER key=$SSH_KEY timeout=${SSH_TIMEOUT_SEC}s jobs=$TRAIN_JOBS pattern=$TRAIN_GREP)"
+else
+  echo "Train check: disabled"
+fi
+
+for region in $REGIONS; do
+  echo "Scanning $region..." >&2
+  profile_log "$region start"
+  region_start_count="$count"
+
+  if [[ -n "$name_values_csv" ]]; then
+    profile_log "$region name-tag query start"
+    if rows="$(aws_cli ec2 describe-instances \
+      --region "$region" \
+      --filters Name=instance-state-name,Values=running Name=tag:Name,Values=$name_values_csv \
+      --query 'Reservations[].Instances[].[InstanceId,Tags[?Key==`Name`]|[0].Value,PrivateIpAddress,PublicIpAddress]' \
+      --output text 2>&1)"; then
+      process_rows "$region" "tag:Name" "$rows"
+    elif [[ "$rows" == *"UnauthorizedOperation"* || "$rows" == *"AuthFailure"* ]]; then
+      echo "Skipping $region (no ec2:DescribeInstances; likely SCP deny)" >&2
+      continue
+    else
+      echo "Name tag query failed in $region: $(printf '%s\n' "$rows" | head -n 1)" >&2
+    fi
+    profile_log "$region name-tag query done"
+  fi
+
+  # Tag-based matching.
+  if [[ "$ENABLE_OWNER_TAGS" == "1" && -n "$values_csv" ]]; then
+    profile_log "$region owner-tag query start"
+    if command -v jq >/dev/null 2>&1; then
+      tag_keys_csv="$(IFS=,; echo "${TAG_KEYS[*]}")"
+      tag_keys_json="$(json_array_from_args "${TAG_KEYS[@]}")"
+      values_json="$(json_array_from_args "${candidate_values[@]}")"
+      tag_json="$(aws_cli ec2 describe-instances \
+        --region "$region" \
+        --filters Name=instance-state-name,Values=running Name=tag-key,Values=$tag_keys_csv \
+        --output json 2>/dev/null || true)"
+      rows="$(printf '%s\n' "$tag_json" | jq -r \
+        --arg region "$region" \
+        --argjson keys "$tag_keys_json" \
+        --argjson vals "$values_json" '
+          .Reservations[].Instances[] as $i
+          | ($i.Tags // []) as $tags
+          | (first($tags[]? | select(($keys | index(.Key)) and ($vals | index(.Value))) | .Key) // empty) as $match_key
+          | select($match_key != "")
+          | [
+              $region,
+              $i.InstanceId,
+              (first($tags[]? | select(.Key == "Name") | .Value) // "-"),
+              ($i.PrivateIpAddress // "-"),
+              ($i.PublicIpAddress // "-"),
+              ("tag:" + $match_key)
+            ]
+          | @tsv
+        ' 2>/dev/null || true)"
+      process_rows_with_match "$rows"
+    else
+      for tag in "${TAG_KEYS[@]}"; do
+        rows="$(aws_cli ec2 describe-instances \
+          --region "$region" \
+          --filters Name=instance-state-name,Values=running Name=tag:$tag,Values=$values_csv \
+          --query 'Reservations[].Instances[].[InstanceId,Tags[?Key==`Name`]|[0].Value,PrivateIpAddress,PublicIpAddress]' \
+          --output text 2>/dev/null || true)"
+
+        process_rows "$region" "tag:$tag" "$rows"
+      done
+    fi
+    profile_log "$region owner-tag query done"
+  fi
+
+  if [[ "$ENABLE_CLOUDTRAIL" == "1" ]]; then
+    profile_log "$region cloudtrail lookup start"
+    ct_start="$(date -u -d "$CT_LOOKBACK_DAYS days ago" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || true)"
+
+    ct_cmd=(
+      aws_cli cloudtrail lookup-events
+      --region "$region"
+      --lookup-attributes "AttributeKey=Username,AttributeValue=$CT_USERNAME"
+      --query 'Events[?EventName==`RunInstances`].Resources[].ResourceName'
+      --output text
+    )
+    if [[ -n "$ct_start" ]]; then
+      ct_cmd+=(--start-time "$ct_start")
+    fi
+    if [[ -n "$CT_MAX_ITEMS" ]]; then
+      ct_cmd+=(--max-items "$CT_MAX_ITEMS")
+    fi
+
+    ct_stdout_file="$(mktemp)"
+    ct_stderr_file="$(mktemp)"
+    ct_rc=0
+    if "${ct_cmd[@]}" >"$ct_stdout_file" 2>"$ct_stderr_file"; then
+      ct_rc=0
+    else
+      ct_rc=$?
+    fi
+    ct_out="$(cat "$ct_stdout_file" 2>/dev/null || true)"
+    ct_err="$(cat "$ct_stderr_file" 2>/dev/null || true)"
+    rm -f "$ct_stdout_file" "$ct_stderr_file"
+
+    if [[ "$ct_rc" -ne 0 ]]; then
+      if [[ "$ct_err" == *"AccessDenied"* || "$ct_err" == *"UnauthorizedOperation"* ]]; then
+        echo "CloudTrail lookup unavailable in $region (skipping launch-history matching)" >&2
+        ct_out=""
+      elif [[ "$ct_err" == *"ThrottlingException"* ]]; then
+        echo "CloudTrail throttled in $region; using partial results (if any)" >&2
+      else
+        echo "CloudTrail lookup failed in $region: $(printf '%s\n' "$ct_err" | head -n 1)" >&2
+      fi
+    fi
+
+    mapfile -t ct_ids < <(printf '%s\n%s\n' "$ct_out" "$ct_err" | tr '\t' '\n' | grep -E '^i-[0-9a-f]+$' | sort -u)
+    total_ids="${#ct_ids[@]}"
+
+    if [[ "$total_ids" -gt 0 ]]; then
+      for ((i=0; i<total_ids; i+=CT_BATCH_SIZE)); do
+        batch=("${ct_ids[@]:i:CT_BATCH_SIZE}")
+
+        if ! rows=$(aws_cli ec2 describe-instances \
+          --region "$region" \
+          --instance-ids "${batch[@]}" \
+          --filters Name=instance-state-name,Values=running \
+          --query 'Reservations[].Instances[].[InstanceId,Tags[?Key==`Name`]|[0].Value,PrivateIpAddress,PublicIpAddress]' \
+          --output text 2>&1); then
+
+          # If one stale instance ID poisons the batch, retry one-by-one.
+          if [[ "$rows" == *"InvalidInstanceID.NotFound"* || "$rows" == *"InvalidInstanceID.Malformed"* ]]; then
+            for iid in "${batch[@]}"; do
+              one="$(aws_cli ec2 describe-instances \
+                --region "$region" \
+                --instance-ids "$iid" \
+                --filters Name=instance-state-name,Values=running \
+                --query 'Reservations[].Instances[].[InstanceId,Tags[?Key==`Name`]|[0].Value,PrivateIpAddress,PublicIpAddress]' \
+                --output text 2>/dev/null || true)"
+              process_rows "$region" "cloudtrail:RunInstances" "$one"
+            done
+          else
+            echo "Batch describe failed in $region: $(printf '%s\n' "$rows" | head -n 1)" >&2
+          fi
+
+          continue
+        fi
+
+        process_rows "$region" "cloudtrail:RunInstances" "$rows"
+      done
+    fi
+    profile_log "$region cloudtrail lookup done"
+  fi
+
+  echo "Finished $region: +$((count - region_start_count)) matches" >&2
+  profile_log "$region done"
+done
+
+output_rows "$ROW_FILE"
+
+if [[ "$count" -eq 0 ]]; then
+  echo "No running instances matched your identity via tags or CloudTrail launch history." >&2
+  echo "Try overrides: ME=user@company.com CT_USERNAME=user@company.com REGIONS='us-west-2 us-east-2'" >&2
+  echo "For launch-history matching: ENABLE_CLOUDTRAIL=1 ~/list-ec2.sh" >&2
+fi

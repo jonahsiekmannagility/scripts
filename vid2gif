@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -ne 1 ]]; then
+  echo "Usage: $(basename "$0") <video-file>" >&2
+  exit 2
+fi
+
+input=$1
+
+if [[ ! -f "$input" ]]; then
+  echo "Error: file not found: $input" >&2
+  exit 1
+fi
+
+if ! command -v ffmpeg >/dev/null 2>&1; then
+  echo "Error: ffmpeg is required but was not found in PATH" >&2
+  exit 1
+fi
+
+dir=$(dirname "$input")
+filename=$(basename "$input")
+basename=${filename%.*}
+output="$dir/$basename.gif"
+
+ffmpeg -hide_banner -loglevel warning -stats -y \
+  -i "$input" \
+  -vf "fps=12,scale=500:-1:flags=lanczos,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse" \
+  -loop 0 \
+  "$output"
+
+echo "Wrote $output"
