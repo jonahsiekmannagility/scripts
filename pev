@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+exec uv run --group rl python -m agility.rl.eval.sim_eval --checkpoint "$@"
