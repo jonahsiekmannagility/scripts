@@ -3,4 +3,4 @@ set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
-exec "$script_dir/pev" "$@" --livestream -1 --num-instances 4 --visualize --terrain-type flat
+exec "$script_dir/pev" "$@" --livestream -1 --num-instances 4 --wbc_env_config.visualize --terrain-type flat
