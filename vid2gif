@@ -25,7 +25,7 @@ output="$dir/$basename.gif"
 
 ffmpeg -hide_banner -loglevel warning -stats -y \
   -i "$input" \
-  -vf "fps=12,scale=500:-1:flags=lanczos,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse" \
+  -vf "fps=12,scale=200:-1:flags=lanczos,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse" \
   -loop 0 \
   "$output"
 
